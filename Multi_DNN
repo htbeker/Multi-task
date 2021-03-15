@@ -1,0 +1,147 @@
+import pandas as pd
+import numpy as np
+from pandas import Series,DataFrame
+import matplotlib.pyplot as plt
+from pyspark import SparkConf,SparkContext
+from pyspark.sql import HiveContext
+from pyspark.sql.session import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark import StorageLevel
+import datetime
+import time
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import TruncatedSVD
+import pyspark.sql.functions as func
+from pyspark.sql.functions import datediff
+from datetime import datetime,date,timedelta
+from pyspark.ml.feature import OneHotEncoder
+from pyspark.ml.feature import StringIndexer
+from pyspark.sql.types import StringType,ArrayType
+from pyspark.ml.feature import StopWordsRemover
+from pyspark.ml.linalg import SparseVector
+from pyspark.sql.functions import udf
+from pyspark.ml.linalg import Vectors
+import jieba
+from pyspark.ml import Pipeline
+from datetime import datetime, date, timedelta
+import tensorflow as tf
+time_now = date.today()
+
+#数据不方便放出来，长这样：
+
+user_id	store_id	sku_id	search_keyword	label	category_id	brand_id	ware_type	label_1
+7771	47386178	198	119617	康师傅	0	14486	216	0.0	0
+11482	385086	390	100821243	芝麻油	1	14168	514	0.0	1
+
+import collections
+
+# 给列新增数字索引列¶
+# 目的是：防止embedding过大
+def add_index_column(param_df, column_name):
+    values = list(param_df[column_name].unique())
+    value_index_dict = {value:idx for idx,value in enumerate(values)}
+    param_df[f"{column_name}_idx"] = param_df[column_name].map(value_index_dict)
+
+add_index_column(df, "user_id")
+add_index_column(df, "store_id")
+add_index_column(df, "sku_id")
+add_index_column(df, "search_keyword")
+add_index_column(df, "category_id")
+add_index_column(df, "brand_id")
+add_index_column(df, "ware_type")
+
+num_user_ids = df["user_id_idx"].max() + 1
+num_store_ids = df["store_id_idx"].max() + 1
+num_sku_ids = df["sku_id_idx"].max() + 1
+num_search_keywords = df["search_keyword_idx"].max() + 1
+num_category_ids = df["category_id_idx"].max() + 1
+num_brand_ids = df["brand_id_idx"].max() + 1
+num_ware_types = df["ware_type_idx"].max() + 1
+
+#构建训练数据集
+df_sample = df.sample(frac=0.4)
+X = df_sample[["user_id_idx","store_id_idx","sku_id_idx","search_keyword_idx","category_id_idx","brand_id_idx",'ware_type_idx']]
+y_1 = df_sample.pop("label")
+y_2 = df_sample.pop('label_1')
+
+# 搭建双任务并训练
+def get_model():
+    """函数式API搭建双塔DNN模型"""
+
+    # 输入
+    user_id = tf.keras.layers.Input(shape=(1,), name="user_id")
+    store_id = tf.keras.layers.Input(shape=(1,), name="store_id")
+    sku_id = tf.keras.layers.Input(shape=(1,), name="sku_id")
+    search_keyword = tf.keras.layers.Input(shape=(1,), name="search_keyword")
+    category_id = tf.keras.layers.Input(shape=(1,), name="category_id")
+    brand_id = tf.keras.layers.Input(shape=(1,), name="brand_id")
+    ware_type = tf.keras.layers.Input(shape=(1,), name="ware_type")
+
+    # user特征
+    user_vector = tf.keras.layers.concatenate([
+        tf.keras.layers.Embedding(num_user_ids, 32)(user_id),
+        tf.keras.layers.Embedding(num_store_ids, 8)(store_id),
+        tf.keras.layers.Embedding(num_search_keywords, 16)(search_keyword)
+    ])
+    user_vector = tf.keras.layers.Dense(32, activation='relu')(user_vector)
+    user_vector = tf.keras.layers.Dense(8, activation='relu',
+                               name="user_embedding", kernel_regularizer='l2')(user_vector)
+
+    # item特征
+    movie_vector = tf.keras.layers.concatenate([
+        tf.keras.layers.Embedding(num_sku_ids, 32)(sku_id),
+        tf.keras.layers.Embedding(num_category_ids, 8)(category_id),
+        tf.keras.layers.Embedding(num_brand_ids, 8)(brand_id),
+        tf.keras.layers.Embedding(num_ware_types, 2)(ware_type)
+    ])
+    movie_vector = tf.keras.layers.Dense(32, activation='relu')(movie_vector)
+    movie_vector = tf.keras.layers.Dense(8, activation='relu',
+                                name="movie_embedding", kernel_regularizer='l2')(movie_vector)
+
+    x = tf.keras.layers.concatenate([user_vector,movie_vector])
+    out1 = tf.keras.layers.Dense(16,activation = 'relu')(x)
+    out1 = tf.keras.layers.Dense(8,activation = 'relu')(out1)
+    out1 = tf.keras.layers.Dense(1, activation='sigmoid',name = 'out1')(out1)
+    
+    out2 = tf.keras.layers.Dense(16,activation = 'relu')(x)
+    out2 = tf.keras.layers.Dense(8,activation = 'relu')(out2)
+    out2 = tf.keras.layers.Dense(1, activation='sigmoid',name = 'out2')(out2)
+
+    return tf.keras.models.Model(inputs=[user_id, sku_id, store_id, search_keyword, category_id, brand_id,ware_type], 
+                              outputs=[out1,out2])
+
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.05,beta_1=0.9, beta_2=0.99, epsilon=1e-08, decay=0.01)
+loss=tf.keras.losses.binary_crossentropy
+model = get_model()
+model.compile(loss={'out1':loss,"out2":loss},loss_weights = {'out1':1,"out2":0.2},
+              optimizer=optimizer,metrics=['accuracy'])
+fit_x_train = [
+        X["user_id_idx"],
+        X["sku_id_idx"],
+        X["store_id_idx"],
+        X["search_keyword_idx"],
+        X["category_id_idx"],
+        X["brand_id_idx"],
+        X["ware_type_idx"]
+    ]
+
+from datetime import datetime
+TIMESTAMP = "{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
+tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir="./logs/logs_"+TIMESTAMP)
+
+history = model.fit(
+    x=fit_x_train,
+    y=[y_1,y_2],
+    batch_size=64,
+    epochs=1,
+    verbose=1,
+    callbacks=[tensorboard_callback]
+)
+
+#搞定
+
+
